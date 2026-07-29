@@ -1,0 +1,268 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-9b-demo-v6e
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels:
+        app: qwen3-9b-demo-v6e
+    spec:
+      shareProcessNamespace: true
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-flex-pool
+        cloud.google.com/gke-flex-start: "true"
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Equal"
+          value: "present"
+          effect: "NoSchedule"
+      containers:
+        - name: vllm-server
+          image: vllm/vllm-tpu:latest
+          args:
+            - "vllm"
+            - "serve"
+            - "Qwen/Qwen3.5-9B"
+            - "--tensor-parallel-size"
+            - "1"
+            - "--data-parallel-size"
+            - "1"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--served-model-name"
+            - "Qwen/Qwen3.5-9B"
+            - "--max-model-len"
+            - "8192"
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "qwen3_coder" # Using qwen3_coder tool parser for Qwen 3.5
+            - "--reasoning-parser"
+            - "qwen3" # Using qwen3 reasoning parser
+            - "--trust-remote-code"
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: HF_HOME
+              value: /hf-cache
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "1200"
+            - name: JAX_TRACEBACK_FILTERING
+              value: "off"
+          resources:
+            limits:
+              google.com/tpu: "8" # Updated to match 2x4 v6e slice topology
+            requests:
+              google.com/tpu: "8"
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /hf-cache
+            - name: dshm
+              mountPath: /dev/shm
+
+        - name: native-bench-client
+          image: vllm/vllm-tpu:latest
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: JAX_PLATFORMS
+              value: "cpu"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "/secret/key.json"
+          command:
+            - "bash"
+            - "-c"
+            - |
+              set -ex
+              trap 'pkill -f vllm || true' EXIT
+
+              echo "Waiting for vLLM server..."
+              until curl -sf http://localhost:8000/health; do
+                sleep 5
+              done
+              echo "vLLM server is healthy and ready."
+
+              echo "========================================================="
+              echo "1. DEMO: STRUCTURED OUTPUT WITH REASONING (QWEN 3.5)"
+              echo "========================================================="
+              curl -s -X POST http://localhost:8000/v1/chat/completions \
+                  -H "Content-Type: application/json" \
+                  -d '{
+                    "model": "Qwen/Qwen3.5-9B",
+                    "messages": [{"role": "user", "content": "Extract the information from this text: Alice is a 29 year old data scientist living in New York."}],
+                    "temperature": 0.0,
+                    "response_format": {
+                      "type": "json_schema",
+                      "json_schema": {
+                        "name": "user_profile",
+                        "schema": {
+                          "type": "object",
+                          "properties": {
+                            "name": {"type": "string"},
+                            "age": {"type": "integer"},
+                            "occupation": {"type": "string"},
+                            "city": {"type": "string"}
+                          },
+                          "required": ["name", "age", "occupation", "city"]
+                        }
+                      }
+                    }
+                  }' | python3 -c "
+              import sys, json
+              data = json.load(sys.stdin)
+              msg = data['choices'][0]['message']
+              reasoning = msg.get('reasoning') or msg.get('reasoning_content') or ''
+              if reasoning:
+                  print('\n--- REASONING OUTPUT ---')
+                  print(reasoning)
+              try:
+                  parsed_json = json.loads(msg['content'])
+                  print('\n--- STRUCTURED JSON OUTPUT ---')
+                  print(json.dumps(parsed_json, indent=2))
+              except Exception:
+                  print('\n--- RAW CONTENT ---')
+                  print(msg['content'])
+              "
+
+              echo -e "\n========================================================="
+              echo "2. DEMO: TOOL CALLING WITH REASONING (qwen3_coder / qwen3)"
+              echo "========================================================="
+              curl -s -X POST http://localhost:8000/v1/chat/completions \
+                  -H "Content-Type: application/json" \
+                  -d '{
+                    "model": "Qwen/Qwen3.5-9B",
+                    "messages": [{"role": "user", "content": "Can you check the weather in Chicago?"}],
+                    "temperature": 0.0,
+                    "tools": [
+                      {
+                        "type": "function",
+                        "function": {
+                          "name": "get_weather",
+                          "description": "Get the current weather in a given location",
+                          "parameters": {
+                            "type": "object",
+                            "properties": {
+                              "location": {"type": "string", "description": "The city and state, e.g., Chicago, IL"}
+                            },
+                            "required": ["location"]
+                          }
+                        }
+                      }
+                    ],
+                    "tool_choice": "auto"
+                  }' | python3 -c "
+              import sys, json
+              data = json.load(sys.stdin)
+              msg = data['choices'][0]['message']
+              reasoning = msg.get('reasoning') or msg.get('reasoning_content') or ''
+              if reasoning:
+                  print('\n--- REASONING OUTPUT ---')
+                  print(reasoning)
+              tool_calls = msg.get('tool_calls', [])
+              print('\n--- TOOL CALLS REQUESTED ---')
+              print(json.dumps(tool_calls, indent=2))
+              "
+
+              echo -e "\n========================================================="
+              echo "3. DEMO: THROUGHPUT & LATENCY BENCHMARK SWEEP"
+              echo "========================================================="
+              mkdir -p /workspace/output
+              for C in 1 4 8 16 32 64; do
+                NUM_PROMPTS=$((C * 15))
+                if [ "$NUM_PROMPTS" -lt 30 ]; then NUM_PROMPTS=30; fi
+                echo "Running benchmark at concurrency ${C} with ${NUM_PROMPTS} prompts..."
+                vllm bench serve \
+                    --backend openai \
+                    --model Qwen/Qwen3.5-9B \
+                    --dataset-name random \
+                    --random-input-len 2000 \
+                    --random-prefix-len 500 \
+                    --random-output-len 400 \
+                    --ignore-eos \
+                    --max-concurrency $C \
+                    --num-prompts $NUM_PROMPTS \
+                    --metric-percentiles 50,90,95,99 \
+                    --percentile-metrics ttft,tpot,itl,e2el \
+                    --save-result \
+                    --result-dir /workspace/output \
+                    --result-filename "base_c${C}_results.json" \
+                    --base-url http://localhost:8000 || echo "[WARN] Benchmark at C=${C} failed or timed out — continuing"
+              done
+
+              echo "Displaying summary table of benchmark results..."
+              python3 -c '
+              import glob, json, os
+              files = glob.glob("/workspace/output/base_c*_results.json")
+              def get_concurrency(f):
+                  return int([p[1:] for p in os.path.basename(f).split("_") if p.startswith("c") and p[1:].isdigit()][0])
+              files.sort(key=get_concurrency)
+              print("\n========================= BENCHMARK SUMMARY TABLE =========================")
+              print("| Concurrency | Completed | Req/s | Tok/s | TTFT P50 (ms) | TTFT P99 (ms) | TPOT P50 (ms) | ITL P99 (ms) |")
+              print("|---|---|---|---|---|---|---|---|")
+              for f in files:
+                  try:
+                      with open(f) as fh: data = json.load(fh)
+                      c_val = get_concurrency(f)
+                      comp = data.get("completed", 0)
+                      req_tp = data.get("request_throughput", 0.0)
+                      tok_tp = data.get("total_token_throughput", 0.0)
+                      ttft50 = data.get("p50_ttft_ms", 0.0)
+                      ttft99 = data.get("p99_ttft_ms", 0.0)
+                      tpot50 = data.get("p50_tpot_ms", 0.0)
+                      itl99 = data.get("p99_itl_ms", 0.0)
+                      print(f"| {c_val} | {comp} | {req_tp:.2f} | {tok_tp:.0f} | {ttft50:.1f} | {ttft99:.1f} | {tpot50:.2f} | {itl99:.1f} |")
+                  except Exception:
+                      print(f"| {get_concurrency(f)} | ERROR | - | - | - | - | - | - |")
+              print("===========================================================================\n")
+              '
+
+              echo "Uploading results to GCS bucket roblox-g4-v6e-benchmarking..."
+              pip install -q google-cloud-storage
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              python3 -c "
+              import os
+              from google.cloud import storage
+              client = storage.Client()
+              bucket = client.bucket('roblox-g4-v6e-benchmarking')
+              for r, d, f in os.walk('/workspace/output'):
+                  for file in f:
+                      p = os.path.join(r, file)
+                      blob_path = f'qwen3.5-9b-demo/v6e/${TIMESTAMP}/{file}'
+                      b = bucket.blob(blob_path)
+                      b.upload_from_filename(p)
+                      print(f'Uploaded {file} -> gs://roblox-g4-v6e-benchmarking/{blob_path}')
+              "
+
+              echo "All demos and benchmarks completed cleanly."
+          volumeMounts:
+            - name: output-volume
+              mountPath: /workspace/output
+            - name: gcs-key
+              mountPath: /secret
+              readOnly: true
+      volumes:
+        - name: output-volume
+          emptyDir: {}
+        - name: hf-cache
+          emptyDir:
+            medium: Memory
+            sizeLimit: 100Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: gcs-key
+          secret:
+            secretName: gcs-key
